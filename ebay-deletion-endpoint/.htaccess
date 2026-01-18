@@ -1,0 +1,3 @@
+RewriteEngine On
+RewriteCond %{REQUEST_URI} ^/ebay/deletion
+RewriteRule ^(.*)$ http://10.0.50.10:3001/$1 [P,L]

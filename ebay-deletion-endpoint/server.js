@@ -8,7 +8,7 @@ app.use(express.json());
 // CONFIGURE THESE VALUES
 // ======================================
 const VERIFICATION_TOKEN = "your_secret_token_here_change_this"; // Create your own secret token
-const ENDPOINT_URL = "https://yourdomain.com/ebay/deletion"; // Your public endpoint URL
+const ENDPOINT_URL = "https://ebay.fetz.dev/ebay/deletion"; // Your public endpoint URL
 const PORT = 3001;
 // ======================================
 
