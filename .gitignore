@@ -141,3 +141,8 @@ vite.config.ts.timestamp-*
 # secrets
 config.json
 .env
+
+# Project specific
+crash_reports/
+data/listings.json
+ebay-deletion-endpoint/node_modules/
