@@ -37,6 +37,80 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
+// ---- Crash report logging ----
+const crashReportsDir = path.join(__dirname, "crash_reports");
+
+function writeCrashReport(type, error) {
+  try {
+    // Ensure crash_reports folder exists
+    if (!fs.existsSync(crashReportsDir)) {
+      fs.mkdirSync(crashReportsDir, { recursive: true });
+    }
+
+    // Find next index
+    const existingFiles = fs.readdirSync(crashReportsDir)
+      .filter(f => f.startsWith("crash_report_") && f.endsWith(".txt"));
+    const indices = existingFiles.map(f => {
+      const match = f.match(/crash_report_(\d+)\.txt/);
+      return match ? parseInt(match[1], 10) : 0;
+    });
+    const nextIndex = indices.length > 0 ? Math.max(...indices) + 1 : 1;
+
+    // Build report content
+    const timestamp = new Date().toISOString();
+    const stack = error?.stack || String(error);
+    const report = [
+      `=== CRASH REPORT #${nextIndex} ===`,
+      `Type: ${type}`,
+      `Time: ${timestamp}`,
+      ``,
+      `Error: ${error?.message || String(error)}`,
+      ``,
+      `Stack Trace:`,
+      stack,
+      ``,
+      `=== END REPORT ===`,
+    ].join("\n");
+
+    // Write file
+    const filePath = path.join(crashReportsDir, `crash_report_${nextIndex}.txt`);
+    fs.writeFileSync(filePath, report, "utf8");
+    console.error(`Crash report written to: ${filePath}`);
+  } catch (writeErr) {
+    console.error("Failed to write crash report:", writeErr);
+  }
+}
+
+// ---- Global error handlers to prevent crashes ----
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled promise rejection:", err);
+  writeCrashReport("Unhandled Promise Rejection", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+  writeCrashReport("Uncaught Exception", err);
+});
+
+// ---- Discord client error handling ----
+client.on("error", (err) => {
+  console.error("Discord client error:", err);
+  writeCrashReport("Discord Client Error", err);
+});
+
+client.on("shardError", (err) => {
+  console.error("Discord websocket error:", err);
+  writeCrashReport("Discord WebSocket Error", err);
+});
+
+client.on("shardDisconnect", (event, shardId) => {
+  console.warn(`Shard ${shardId} disconnected (code ${event.code}). Reconnecting...`);
+});
+
+client.on("shardReconnecting", (shardId) => {
+  console.log(`Shard ${shardId} reconnecting...`);
+});
+
 // -------------------------
 // Simple JSON "DB"
 // -------------------------
@@ -1012,28 +1086,38 @@ async function updateEbayListing(channelId, listing) {
 function startEbayUpdateLoop() {
   // Run every minute, but respect individual listing intervals
   setInterval(async () => {
-    const db = loadDb();
-    if (!db.ebayListings) return;
+    try {
+      const db = loadDb();
+      if (!db.ebayListings) return;
 
-    const now = Date.now();
+      const now = Date.now();
 
-    for (const [channelId, listing] of Object.entries(db.ebayListings)) {
-      // Skip closed or ended listings
-      if (listing.status === "closed" || listing.status === "ended") continue;
+      for (const [channelId, listing] of Object.entries(db.ebayListings)) {
+        try {
+          // Skip closed or ended listings
+          if (listing.status === "closed" || listing.status === "ended") continue;
 
-      const interval = getUpdateIntervalMs(listing.endTime);
-      if (interval === null) {
-        // Auction ended - do one final update
-        listing.status = "ended";
-        await updateEbayListing(channelId, listing);
-        continue;
+          const interval = getUpdateIntervalMs(listing.endTime);
+          if (interval === null) {
+            // Auction ended - do one final update
+            listing.status = "ended";
+            await updateEbayListing(channelId, listing);
+            continue;
+          }
+
+          // Check if it's time to update this listing
+          const timeSinceLastCheck = now - (listing.lastChecked || 0);
+          if (timeSinceLastCheck >= interval) {
+            await updateEbayListing(channelId, listing);
+          }
+        } catch (err) {
+          console.error(`Error processing listing ${channelId}:`, err.message);
+          writeCrashReport(`eBay Listing Update Error (${channelId})`, err);
+        }
       }
-
-      // Check if it's time to update this listing
-      const timeSinceLastCheck = now - (listing.lastChecked || 0);
-      if (timeSinceLastCheck >= interval) {
-        await updateEbayListing(channelId, listing);
-      }
+    } catch (err) {
+      console.error("Error in eBay update loop:", err.message);
+      writeCrashReport("eBay Update Loop Error", err);
     }
   }, 60 * 1000); // Check every minute
 
