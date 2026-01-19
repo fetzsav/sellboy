@@ -147,3 +147,4 @@ config.json
 crash_reports/
 data/listings.json
 ebay-deletion-endpoint/node_modules/
+data/listings.json
