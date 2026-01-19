@@ -16,8 +16,12 @@ const {
   ChannelType,
   PermissionFlagsBits,
   EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder,
 } = require("discord.js");
 
+const config = require("./config.json");
 const {
   token,
   guildId,
@@ -26,8 +30,64 @@ const {
   staffRoleId,
   dataFile,
   ebayIntakeChannelId,
-  ebayListingsCategoryId,
-} = require("./config.json");
+  ebayAuctionsCategoryId,
+  ebayBuyItNowCategoryId,
+  ebayArchivedCategoryId,
+} = config;
+
+// Config-based eBay credentials (optional - can be empty)
+const configEbayAppId = config.ebayAppId || "";
+const configEbayDevId = config.ebayDevId || "";
+const configEbayCertId = config.ebayCertId || "";
+
+// -------------------------
+// Slash Command Definitions
+// -------------------------
+const commands = [
+  new SlashCommandBuilder()
+    .setName("ebay-setup")
+    .setDescription("Configure eBay API credentials")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("ebay-status")
+    .setDescription("Check eBay API configuration status")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("ebay-clear")
+    .setDescription("Remove eBay API credentials")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("ebay-organize")
+    .setDescription("Check all eBay listings and move them to correct categories")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+];
+
+async function registerSlashCommands() {
+  const rest = new REST({ version: "10" }).setToken(token);
+  try {
+    console.log("Registering slash commands...");
+    await rest.put(Routes.applicationGuildCommands(config.clientId || "", guildId), {
+      body: commands.map((c) => c.toJSON()),
+    });
+    console.log("Slash commands registered.");
+  } catch (err) {
+    // If clientId not configured, try to get it from the bot's application
+    if (!config.clientId) {
+      console.log("clientId not in config, fetching from Discord...");
+      try {
+        const app = await rest.get(Routes.oauth2CurrentApplication());
+        await rest.put(Routes.applicationGuildCommands(app.id, guildId), {
+          body: commands.map((c) => c.toJSON()),
+        });
+        console.log("Slash commands registered.");
+      } catch (innerErr) {
+        console.error("Failed to register slash commands:", innerErr);
+      }
+    } else {
+      console.error("Failed to register slash commands:", err);
+    }
+  }
+}
 
 // ---- Intents ----
 // Guilds: interactions + channels
@@ -193,7 +253,137 @@ function memberIsStaff(interaction) {
 }
 
 // -------------------------
-// eBay Scraper
+// eBay API (optional - falls back to scraping if not configured)
+// -------------------------
+let ebayAccessToken = null;
+let ebayTokenExpiry = 0;
+
+// Get eBay credentials from database first, then fall back to config
+function getEbayCredentials() {
+  const db = loadDb();
+  if (db.ebayCredentials?.appId && db.ebayCredentials?.certId) {
+    return {
+      appId: db.ebayCredentials.appId,
+      devId: db.ebayCredentials.devId || "",
+      certId: db.ebayCredentials.certId,
+      source: "database",
+    };
+  }
+  if (configEbayAppId && configEbayCertId) {
+    return {
+      appId: configEbayAppId,
+      devId: configEbayDevId,
+      certId: configEbayCertId,
+      source: "config",
+    };
+  }
+  return null;
+}
+
+// Check if eBay API is enabled (credentials are configured)
+function isEbayApiEnabled() {
+  return getEbayCredentials() !== null;
+}
+
+async function getEbayAccessToken() {
+  // Return cached token if still valid (with 5 min buffer)
+  if (ebayAccessToken && Date.now() < ebayTokenExpiry - 300000) {
+    return ebayAccessToken;
+  }
+
+  const creds = getEbayCredentials();
+  if (!creds) {
+    throw new Error("eBay API credentials not configured");
+  }
+
+  const credentials = Buffer.from(`${creds.appId}:${creds.certId}`).toString("base64");
+
+  const response = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Authorization": `Basic ${credentials}`,
+    },
+    body: "grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope",
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`eBay OAuth failed: ${response.status} - ${error}`);
+  }
+
+  const data = await response.json();
+  ebayAccessToken = data.access_token;
+  ebayTokenExpiry = Date.now() + (data.expires_in * 1000);
+
+  console.log("eBay API token obtained, expires in", data.expires_in, "seconds");
+  return ebayAccessToken;
+}
+
+async function fetchEbayListingViaAPI(url) {
+  // Extract item ID from URL
+  const itemIdMatch = url.match(/\/itm\/(?:.*\/)?(\d+)/);
+  if (!itemIdMatch) {
+    throw new Error("Could not extract item ID from URL");
+  }
+  const itemId = itemIdMatch[1];
+
+  const token = await getEbayAccessToken();
+
+  const response = await fetch(`https://api.ebay.com/buy/browse/v1/item/v1|${itemId}|0`, {
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+      "X-EBAY-C-ENDUSERCTX": "affiliateCampaignId=<ePNCampaignId>,affiliateReferenceId=<referenceId>",
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`eBay API error: ${response.status} - ${error}`);
+  }
+
+  const item = await response.json();
+
+  // Parse the API response into our standard format
+  const endTime = item.itemEndDate ? new Date(item.itemEndDate).getTime() : null;
+
+  // Determine listing type from buyingOptions
+  const buyingOptions = item.buyingOptions || [];
+  const isAuction = buyingOptions.includes("AUCTION");
+  const isFixedPrice = buyingOptions.includes("FIXED_PRICE");
+
+  let listingType;
+  let buyItNowPrice = null;
+
+  if (isAuction && isFixedPrice) {
+    listingType = "auction_with_bin";
+    // For auction+BIN, the main price is current bid, BIN price is in currentBidPrice or buyItNowPrice
+    buyItNowPrice = item.buyItNowPrice ? `${item.buyItNowPrice.currency} $${item.buyItNowPrice.value}` : null;
+  } else if (isAuction) {
+    listingType = "auction";
+  } else {
+    listingType = "buy_it_now";
+  }
+
+  return {
+    title: item.title || "Unknown Item",
+    currentPrice: item.price ? `${item.price.currency} $${item.price.value}` : "N/A",
+    bidCount: item.bidCount || 0,
+    endTime,
+    imageUrl: item.image?.imageUrl || null,
+    description: item.shortDescription || item.description?.substring(0, 500) || "",
+    views: item.viewCount || 0,
+    watchers: item.watchCount || 0,
+    status: item.itemEndDate && new Date(item.itemEndDate) < new Date() ? "ended" : "active",
+    source: "api",
+    listingType,
+    buyItNowPrice,
+  };
+}
+
+// -------------------------
+// eBay Scraper (fallback)
 // -------------------------
 async function scrapeEbayListing(url) {
   const response = await fetch(url, {
@@ -343,6 +533,35 @@ async function scrapeEbayListing(url) {
                   $(".x-end-panel").text().toLowerCase().includes("ended") ||
                   html.toLowerCase().includes("bidding has ended");
 
+  // Determine listing type
+  // Check for auction indicators (bid count element, "Place bid" button, bid history)
+  const hasAuctionIndicators = $(".x-bid-count").length > 0 ||
+                               $("[data-testid='x-bid-count']").length > 0 ||
+                               html.includes("Place bid") ||
+                               html.includes("bid history");
+
+  // Check for Buy It Now indicators
+  const hasBinIndicators = $(".x-bin-price").length > 0 ||
+                           $("[data-testid='x-bin-action']").length > 0 ||
+                           html.includes("Buy It Now");
+
+  let listingType;
+  let buyItNowPrice = null;
+
+  if (hasAuctionIndicators && hasBinIndicators) {
+    listingType = "auction_with_bin";
+    // Extract BIN price
+    const binPriceText = $(".x-bin-price__content span").first().text().trim() ||
+                         $(".x-bin-price span.ux-textspans").first().text().trim();
+    if (binPriceText) {
+      buyItNowPrice = binPriceText;
+    }
+  } else if (hasAuctionIndicators) {
+    listingType = "auction";
+  } else {
+    listingType = "buy_it_now";
+  }
+
   return {
     title,
     currentPrice,
@@ -353,7 +572,31 @@ async function scrapeEbayListing(url) {
     views,
     watchers,
     status: isEnded ? "ended" : "active",
+    source: "scrape",
+    listingType,
+    buyItNowPrice,
   };
+}
+
+// -------------------------
+// eBay Listing Fetcher (API with scrape fallback)
+// -------------------------
+async function getEbayListing(url) {
+  // Try API first if configured
+  if (isEbayApiEnabled()) {
+    try {
+      const listing = await fetchEbayListingViaAPI(url);
+      console.log(`Fetched listing via eBay API: ${listing.title}`);
+      return listing;
+    } catch (err) {
+      console.warn(`eBay API failed, falling back to scraping: ${err.message}`);
+    }
+  }
+
+  // Fallback to scraping
+  const listing = await scrapeEbayListing(url);
+  console.log(`Fetched listing via scraping: ${listing.title}`);
+  return listing;
 }
 
 // -------------------------
@@ -475,35 +718,63 @@ function formatTimeLeft(endTime) {
 }
 
 function buildEbayListingEmbed(listing) {
+  // Determine color based on status and listing type
+  let color = 0x0064d2; // eBay blue for active
+  if (listing.status === "ended" || listing.status === "sold" || listing.status === "shipped") {
+    color = 0x808080; // Gray for ended/sold/shipped
+  }
+
   const embed = new EmbedBuilder()
     .setTitle(listing.title)
-    .setColor(listing.status === "ended" ? 0x808080 : 0x0064d2)
-    .addFields(
-      { name: "Current Price", value: listing.currentPrice || "N/A", inline: true },
+    .setColor(color);
+
+  // Build description with BIN price for auction+BIN listings
+  let description = listing.description || "";
+  if (listing.listingType === "auction_with_bin" && listing.buyItNowPrice) {
+    description = `**Buy It Now: ${listing.buyItNowPrice}**\n\n${description}`;
+  }
+  if (description) {
+    embed.setDescription(description);
+  }
+
+  // Adjust fields based on listing type
+  if (listing.listingType === "buy_it_now") {
+    embed.addFields(
+      { name: "Price", value: listing.currentPrice || "N/A", inline: true },
+      { name: "Views", value: String(listing.views || 0), inline: true },
+      { name: "Watchers", value: String(listing.watchers || 0), inline: true }
+    );
+  } else {
+    // Auction or auction_with_bin
+    embed.addFields(
+      { name: "Current Bid", value: listing.currentPrice || "N/A", inline: true },
       { name: "Bids", value: String(listing.bidCount), inline: true },
       { name: "Time Left", value: formatTimeLeft(listing.endTime), inline: true },
       { name: "Views", value: String(listing.views || 0), inline: true },
       { name: "Watchers", value: String(listing.watchers || 0), inline: true }
-    )
-    .setFooter({ text: `Last updated: ${new Date(listing.lastChecked).toLocaleString()}` });
+    );
+  }
+
+  embed.setFooter({ text: `Last updated: ${new Date(listing.lastChecked).toLocaleString()} | via ${listing.source === "api" ? "eBay API" : "web scrape"}` });
 
   if (listing.imageUrl) {
     embed.setImage(listing.imageUrl);
   }
 
-  if (listing.description) {
-    embed.setDescription(listing.description);
-  }
-
+  // Update title based on status
   if (listing.status === "ended") {
     embed.setTitle(`[ENDED] ${listing.title}`);
+  } else if (listing.status === "sold") {
+    embed.setTitle(`[SOLD] ${listing.title}`);
+  } else if (listing.status === "shipped") {
+    embed.setTitle(`[SHIPPED] ${listing.title}`);
   }
 
   return embed;
 }
 
-function buildEbayListingButtons(url) {
-  return new ActionRowBuilder().addComponents(
+function buildEbayListingButtons(listing) {
+  const buttons = [
     new ButtonBuilder()
       .setCustomId("ebay_refresh")
       .setLabel("Refresh")
@@ -511,12 +782,42 @@ function buildEbayListingButtons(url) {
     new ButtonBuilder()
       .setLabel("Open on eBay")
       .setStyle(ButtonStyle.Link)
-      .setURL(url),
-    new ButtonBuilder()
-      .setCustomId("ebay_close")
-      .setLabel("Close Tracking")
-      .setStyle(ButtonStyle.Danger)
-  );
+      .setURL(listing.url),
+  ];
+
+  const isAuction = listing.listingType === "auction" || listing.listingType === "auction_with_bin";
+  const isBuyItNow = listing.listingType === "buy_it_now";
+
+  if (listing.status === "active") {
+    // Active listings
+    if (isBuyItNow) {
+      // BIN (active): Refresh, Open on eBay, Mark Sold, Close Tracking
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId("ebay_sold")
+          .setLabel("Mark Sold")
+          .setStyle(ButtonStyle.Success)
+      );
+    }
+    // Both types get Close Tracking when active
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId("ebay_close")
+        .setLabel("Close Tracking")
+        .setStyle(ButtonStyle.Danger)
+    );
+  } else if (listing.status === "ended" || listing.status === "sold") {
+    // Ended auctions or sold BIN: Refresh, Open on eBay, Mark Shipped
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId("ebay_shipped")
+        .setLabel("Mark Shipped")
+        .setStyle(ButtonStyle.Success)
+    );
+  }
+  // shipped status: only Refresh and Open on eBay buttons
+
+  return new ActionRowBuilder().addComponents(buttons);
 }
 
 // -------------------------
@@ -557,6 +858,10 @@ function buildListingIntroMessage(itemName, itemDesc, ownerId) {
 // -------------------------
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Ready! Logged in as ${readyClient.user.tag}`);
+
+  // Register slash commands
+  await registerSlashCommands();
+
   try {
     await ensurePanelMessage();
     console.log("Listing panel ensured.");
@@ -568,6 +873,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     await ensureEbayPanelMessage();
     if (ebayIntakeChannelId) {
       console.log("eBay panel ensured.");
+      console.log(`eBay API: ${isEbayApiEnabled() ? "enabled" : "disabled (using web scraping)"}`);
       startEbayUpdateLoop();
     }
   } catch (err) {
@@ -580,6 +886,292 @@ client.once(Events.ClientReady, async (readyClient) => {
 // -------------------------
 client.on(Events.InteractionCreate, async (interaction) => {
   const db = loadDb();
+
+  // ---- Slash Commands ----
+  if (interaction.isChatInputCommand()) {
+    // /ebay-setup - Show modal to configure credentials
+    if (interaction.commandName === "ebay-setup") {
+      const modal = new ModalBuilder()
+        .setCustomId("ebay_setup_modal")
+        .setTitle("Configure eBay API Credentials");
+
+      const appIdInput = new TextInputBuilder()
+        .setCustomId("ebay_app_id")
+        .setLabel("App ID (Client ID)")
+        .setPlaceholder("YourApp-Sellboy-PRD-xxxxxxxx-xxxxxxxx")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(100);
+
+      const devIdInput = new TextInputBuilder()
+        .setCustomId("ebay_dev_id")
+        .setLabel("Dev ID (optional)")
+        .setPlaceholder("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setMaxLength(100);
+
+      const certIdInput = new TextInputBuilder()
+        .setCustomId("ebay_cert_id")
+        .setLabel("Cert ID (Client Secret)")
+        .setPlaceholder("PRD-xxxxxxxx-xxxx-xxxx-xxxx-xxxx")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(100);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(appIdInput),
+        new ActionRowBuilder().addComponents(devIdInput),
+        new ActionRowBuilder().addComponents(certIdInput)
+      );
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // /ebay-status - Check API configuration status
+    if (interaction.commandName === "ebay-status") {
+      await interaction.deferReply({ ephemeral: true });
+
+      const creds = getEbayCredentials();
+      if (!creds) {
+        await interaction.editReply({
+          content: "**eBay API Status**\n\n❌ Not configured\n\nUse `/ebay-setup` to configure credentials.",
+        });
+        return;
+      }
+
+      // Test the API connection
+      let testResult = "⏳ Testing...";
+      try {
+        // Clear cached token to force a fresh test
+        ebayAccessToken = null;
+        ebayTokenExpiry = 0;
+        await getEbayAccessToken();
+        testResult = "✅ Connection successful";
+      } catch (err) {
+        testResult = `❌ Connection failed: ${err.message}`;
+      }
+
+      const maskedAppId = creds.appId.slice(0, 8) + "..." + creds.appId.slice(-4);
+      const maskedCertId = creds.certId.slice(0, 8) + "..." + creds.certId.slice(-4);
+
+      await interaction.editReply({
+        content: [
+          "**eBay API Status**",
+          "",
+          `✅ Configured (source: ${creds.source})`,
+          `App ID: \`${maskedAppId}\``,
+          `Cert ID: \`${maskedCertId}\``,
+          "",
+          `**API Test:** ${testResult}`,
+        ].join("\n"),
+      });
+      return;
+    }
+
+    // /ebay-clear - Remove stored credentials
+    if (interaction.commandName === "ebay-clear") {
+      await interaction.deferReply({ ephemeral: true });
+
+      const creds = getEbayCredentials();
+      if (!creds) {
+        await interaction.editReply({
+          content: "No eBay credentials are configured.",
+        });
+        return;
+      }
+
+      if (creds.source === "config") {
+        await interaction.editReply({
+          content: "⚠️ Credentials are stored in `config.json`, not the database.\n\nTo remove them, edit the config file directly and remove the `ebayAppId`, `ebayDevId`, and `ebayCertId` fields.",
+        });
+        return;
+      }
+
+      // Remove from database
+      delete db.ebayCredentials;
+      saveDb(db);
+
+      // Clear cached token
+      ebayAccessToken = null;
+      ebayTokenExpiry = 0;
+
+      await interaction.editReply({
+        content: "✅ eBay credentials have been removed from the database.",
+      });
+      return;
+    }
+
+    // /ebay-organize - Organize all eBay listings into correct categories
+    if (interaction.commandName === "ebay-organize") {
+      await interaction.deferReply({ ephemeral: true });
+
+      const guild = await client.guilds.fetch(guildId);
+      const results = {
+        total: 0,
+        moved: 0,
+        emojiUpdated: 0,
+        typeDetected: 0,
+        errors: 0,
+        skipped: 0,
+      };
+
+      if (!db.ebayListings || Object.keys(db.ebayListings).length === 0) {
+        await interaction.editReply({
+          content: "No eBay listings found in the database.",
+        });
+        return;
+      }
+
+      for (const [channelId, listing] of Object.entries(db.ebayListings)) {
+        results.total++;
+
+        try {
+          // Fetch the channel
+          const channel = await guild.channels.fetch(channelId).catch(() => null);
+          if (!channel) {
+            results.skipped++;
+            console.log(`Channel ${channelId} not found, skipping`);
+            continue;
+          }
+
+          // If listing doesn't have a listingType, fetch it from eBay
+          if (!listing.listingType) {
+            try {
+              const freshData = await getEbayListing(listing.url);
+              listing.listingType = freshData.listingType;
+              listing.buyItNowPrice = freshData.buyItNowPrice;
+              results.typeDetected++;
+            } catch (err) {
+              console.error(`Failed to fetch listing type for ${channelId}:`, err.message);
+              results.errors++;
+              continue;
+            }
+          }
+
+          // Determine correct category and emoji based on listing type and status
+          let correctCategoryId, correctEmoji;
+
+          if (listing.status === "shipped") {
+            correctCategoryId = ebayArchivedCategoryId;
+            correctEmoji = "✅";
+          } else if (listing.status === "ended" || listing.status === "sold") {
+            // Ended/sold items stay in their original category with ✅ emoji
+            if (listing.listingType === "buy_it_now") {
+              correctCategoryId = ebayBuyItNowCategoryId;
+            } else {
+              correctCategoryId = ebayAuctionsCategoryId;
+            }
+            correctEmoji = "✅";
+          } else if (listing.listingType === "buy_it_now") {
+            correctCategoryId = ebayBuyItNowCategoryId;
+            correctEmoji = "💰";
+          } else {
+            // auction or auction_with_bin
+            correctCategoryId = ebayAuctionsCategoryId;
+            correctEmoji = "🔨";
+          }
+
+          // Check if channel needs to be moved
+          let needsMove = false;
+          let needsEmojiUpdate = false;
+
+          if (channel.parentId !== correctCategoryId) {
+            needsMove = true;
+          }
+
+          // Check if emoji is correct
+          const currentEmoji = channel.name.charAt(0);
+          if (currentEmoji !== correctEmoji) {
+            needsEmojiUpdate = true;
+          }
+
+          // Move channel if needed
+          if (needsMove) {
+            await channel.setParent(correctCategoryId, { lockPermissions: false });
+            results.moved++;
+          }
+
+          // Update emoji if needed
+          if (needsEmojiUpdate) {
+            // Replace the first emoji with the correct one
+            const newName = correctEmoji + channel.name.slice(1);
+            await channel.setName(newName);
+            results.emojiUpdated++;
+          }
+
+          // Save updated listing data
+          db.ebayListings[channelId] = listing;
+        } catch (err) {
+          console.error(`Error organizing channel ${channelId}:`, err.message);
+          results.errors++;
+        }
+      }
+
+      saveDb(db);
+
+      // Build summary report
+      const report = [
+        "**eBay Listings Organization Complete**",
+        "",
+        `📊 **Summary:**`,
+        `• Total listings checked: ${results.total}`,
+        `• Channels moved: ${results.moved}`,
+        `• Emojis updated: ${results.emojiUpdated}`,
+        `• Listing types detected: ${results.typeDetected}`,
+        `• Errors: ${results.errors}`,
+        `• Skipped (channel not found): ${results.skipped}`,
+      ].join("\n");
+
+      await interaction.editReply({ content: report });
+      return;
+    }
+  }
+
+  // ---- eBay Setup Modal submit ----
+  if (interaction.isModalSubmit() && interaction.customId === "ebay_setup_modal") {
+    await interaction.deferReply({ ephemeral: true });
+
+    const appId = interaction.fields.getTextInputValue("ebay_app_id")?.trim();
+    const devId = interaction.fields.getTextInputValue("ebay_dev_id")?.trim() || "";
+    const certId = interaction.fields.getTextInputValue("ebay_cert_id")?.trim();
+
+    if (!appId || !certId) {
+      await interaction.editReply({
+        content: "❌ App ID and Cert ID are required.",
+      });
+      return;
+    }
+
+    // Save to database
+    db.ebayCredentials = {
+      appId,
+      devId,
+      certId,
+      configuredBy: interaction.user.id,
+      configuredAt: Date.now(),
+    };
+    saveDb(db);
+
+    // Clear cached token to use new credentials
+    ebayAccessToken = null;
+    ebayTokenExpiry = 0;
+
+    // Test the new credentials
+    let testResult = "";
+    try {
+      await getEbayAccessToken();
+      testResult = "✅ Credentials verified - API connection successful!";
+    } catch (err) {
+      testResult = `⚠️ Credentials saved but API test failed: ${err.message}\n\nPlease verify your credentials are correct.`;
+    }
+
+    await interaction.editReply({
+      content: `✅ eBay API credentials saved!\n\n${testResult}`,
+    });
+    return;
+  }
 
   // ---- Create Listing button ----
   if (interaction.isButton() && interaction.customId === "listing_create") {
@@ -803,16 +1395,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch {}
 
     try {
-      const listing = await scrapeEbayListing(url);
+      const listing = await getEbayListing(url);
       const guild = await client.guilds.fetch(guildId);
 
+      // Determine category and emoji based on listing type
+      let categoryId, emoji;
+      if (listing.listingType === "buy_it_now") {
+        categoryId = ebayBuyItNowCategoryId;
+        emoji = "💰";
+      } else {
+        // auction or auction_with_bin
+        categoryId = ebayAuctionsCategoryId;
+        emoji = "🔨";
+      }
+
       // Create channel with simplified name
-      const chanName = await createUniqueChannelName(guild, ebayListingsCategoryId, "💰", listing.title);
+      const chanName = await createUniqueChannelName(guild, categoryId, emoji, listing.title);
 
       const channel = await guild.channels.create({
         name: chanName,
         type: ChannelType.GuildText,
-        parent: ebayListingsCategoryId,
+        parent: categoryId,
         topic: `eBay Tracker | owner=${interaction.user.id} | ${url}`,
         permissionOverwrites: [
           // @everyone can view (or deny if you want private)
@@ -872,6 +1475,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         views: listing.views,
         watchers: listing.watchers,
         status: listing.status,
+        source: listing.source,
+        listingType: listing.listingType,
+        buyItNowPrice: listing.buyItNowPrice,
         lastChecked: now,
         createdAt: now,
       };
@@ -879,7 +1485,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       // Post the listing embed
       const embed = buildEbayListingEmbed(db.ebayListings[channel.id]);
-      const buttons = buildEbayListingButtons(url);
+      const buttons = buildEbayListingButtons(db.ebayListings[channel.id]);
       await channel.send({ embeds: [embed], components: [buttons] });
 
       await interaction.editReply(`Created eBay tracking channel: <#${channel.id}>`);
@@ -901,7 +1507,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply({ ephemeral: true });
 
     try {
-      const newData = await scrapeEbayListing(ebayListing.url);
+      const newData = await getEbayListing(ebayListing.url);
       const oldPrice = ebayListing.currentPrice;
       const oldBidCount = ebayListing.bidCount;
 
@@ -915,12 +1521,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       ebayListing.views = newData.views;
       ebayListing.watchers = newData.watchers;
       ebayListing.status = newData.status;
+      ebayListing.source = newData.source;
       ebayListing.lastChecked = Date.now();
       saveDb(db);
 
       // Update the original message
       const embed = buildEbayListingEmbed(ebayListing);
-      const buttons = buildEbayListingButtons(ebayListing.url);
+      const buttons = buildEbayListingButtons(ebayListing);
       await interaction.message.edit({ embeds: [embed], components: [buttons] });
 
       // Notify if price or bids changed
@@ -935,6 +1542,79 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error("Failed to refresh eBay listing:", err);
       await interaction.editReply(`Failed to refresh: ${err.message}`);
     }
+    return;
+  }
+
+  // ---- eBay Mark Sold button (BIN only) ----
+  if (interaction.isButton() && interaction.customId === "ebay_sold") {
+    const ebayListing = db.ebayListings?.[interaction.channelId];
+    if (!ebayListing) {
+      await interaction.reply({ ephemeral: true, content: "This channel is not an eBay tracking channel." });
+      return;
+    }
+
+    const isOwner = interaction.user.id === ebayListing.ownerId;
+    const isStaff = memberIsStaff(interaction);
+
+    if (!isOwner && !isStaff) {
+      await interaction.reply({ ephemeral: true, content: "Only the channel owner or staff can mark items as sold." });
+      return;
+    }
+
+    // Mark as sold
+    ebayListing.status = "sold";
+    saveDb(db);
+
+    // Change channel emoji from 💰 to ✅
+    try {
+      const newName = interaction.channel.name.replace(/^💰/, "✅");
+      await interaction.channel.setName(newName);
+    } catch {}
+
+    // Update the embed and buttons
+    const embed = buildEbayListingEmbed(ebayListing);
+    const buttons = buildEbayListingButtons(ebayListing);
+    await interaction.message.edit({ embeds: [embed], components: [buttons] });
+
+    await interaction.reply({ content: "✅ **Item sold!** Ready to ship." });
+    return;
+  }
+
+  // ---- eBay Mark Shipped button ----
+  if (interaction.isButton() && interaction.customId === "ebay_shipped") {
+    const ebayListing = db.ebayListings?.[interaction.channelId];
+    if (!ebayListing) {
+      await interaction.reply({ ephemeral: true, content: "This channel is not an eBay tracking channel." });
+      return;
+    }
+
+    const isOwner = interaction.user.id === ebayListing.ownerId;
+    const isStaff = memberIsStaff(interaction);
+
+    if (!isOwner && !isStaff) {
+      await interaction.reply({ ephemeral: true, content: "Only the channel owner or staff can mark items as shipped." });
+      return;
+    }
+
+    // Mark as shipped
+    ebayListing.status = "shipped";
+    saveDb(db);
+
+    // Move channel to archived category
+    try {
+      if (ebayArchivedCategoryId) {
+        await interaction.channel.setParent(ebayArchivedCategoryId, { lockPermissions: false });
+      }
+    } catch (err) {
+      console.error("Failed to move channel to archived category:", err.message);
+    }
+
+    // Update the embed and buttons
+    const embed = buildEbayListingEmbed(ebayListing);
+    const buttons = buildEbayListingButtons(ebayListing);
+    await interaction.message.edit({ embeds: [embed], components: [buttons] });
+
+    await interaction.reply({ content: "📦 **Item shipped and archived!**" });
     return;
   }
 
@@ -1019,7 +1699,7 @@ function getUpdateIntervalMs(endTime) {
 
 async function updateEbayListing(channelId, listing) {
   try {
-    const newData = await scrapeEbayListing(listing.url);
+    const newData = await getEbayListing(listing.url);
     const oldPrice = listing.currentPrice;
     const oldBidCount = listing.bidCount;
     const oldStatus = listing.status;
@@ -1034,6 +1714,7 @@ async function updateEbayListing(channelId, listing) {
     listing.views = newData.views;
     listing.watchers = newData.watchers;
     listing.status = newData.status;
+    listing.source = newData.source;
     listing.lastChecked = Date.now();
 
     const db = loadDb();
@@ -1058,14 +1739,22 @@ async function updateEbayListing(channelId, listing) {
 
         if (embedMsg) {
           const embed = buildEbayListingEmbed(listing);
-          const buttons = buildEbayListingButtons(listing.url);
+          const buttons = buildEbayListingButtons(listing);
           await embedMsg.edit({ embeds: [embed], components: [buttons] });
         }
 
         // Post update notification
         let notification = "";
         if (justEnded) {
-          notification = `🔔 **Auction Ended!**\nFinal Price: ${newData.currentPrice}\nTotal Bids: ${newData.bidCount}`;
+          // Change channel emoji from 🔨 to ✅ for ended auctions
+          try {
+            const newName = channel.name.replace(/^🔨/, "✅");
+            if (newName !== channel.name) {
+              await channel.setName(newName);
+            }
+          } catch {}
+
+          notification = `🔔 **Auction Ended!** Ready to ship.\nFinal Price: ${newData.currentPrice}\nTotal Bids: ${newData.bidCount}`;
         } else if (priceChanged || bidCountChanged) {
           notification = `📢 **Bid Update!**\nPrice: ${oldPrice} → ${newData.currentPrice}\nBids: ${oldBidCount} → ${newData.bidCount}`;
         }
@@ -1094,8 +1783,8 @@ function startEbayUpdateLoop() {
 
       for (const [channelId, listing] of Object.entries(db.ebayListings)) {
         try {
-          // Skip closed or ended listings
-          if (listing.status === "closed" || listing.status === "ended") continue;
+          // Skip closed, ended, sold, or shipped listings
+          if (["closed", "ended", "sold", "shipped"].includes(listing.status)) continue;
 
           const interval = getUpdateIntervalMs(listing.endTime);
           if (interval === null) {
